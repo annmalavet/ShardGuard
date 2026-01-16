@@ -40,13 +40,34 @@
       "stdio": {
         "cmd": "python",
         "args": [
-          "-m",
-          "shardguard.mcp_servers.web_server"
+          [
+            "shardguard.mcp_servers.web_server"
+          ]
         ]
       },
       "tools": {
         "allow": [
           "*"
+        ]
+      }
+    },
+    "email-operations": {
+      "transport": "stdio",
+      "description": "Email service",
+      "tools": {
+        "allow": [
+          "*"
+        ],
+        "deny": [],
+        "rename": {}
+      },
+      "stdio": {
+        "cmd": "python",
+        "framing": "jsonl",
+        "args": [
+          [
+            "src/shardguard/mcp_servers/email_server.py"
+          ]
         ]
       }
     }

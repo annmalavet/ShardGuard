@@ -73,6 +73,7 @@ def add_mcp(
         entry["stdio"] = _build_stdio_entry(stdio)
 
     mcps[name] = entry
+
     _atomic_write(registry_path, reg)
     return reg
 
@@ -133,8 +134,8 @@ def parse_transport_config(
     stdio_config = {"cmd": cmd, "framing": framing}
 
     parsed_args = _parse_json_arg(args)
-    if parsed_args:
-        stdio_config["args"] = parsed_args
+    if args is not None:
+        stdio_config["args"] = parsed_args if parsed_args is not None else args
 
     if cwd:
         stdio_config["cwd"] = cwd
@@ -187,8 +188,19 @@ def _build_stdio_entry(stdio: dict[str, Any] | None) -> dict[str, Any]:
         "cmd": stdio["cmd"],
         "framing": (stdio.get("framing") or "jsonl").lower(),
     }
-    if args_list:
+    if isinstance(args_list, str):
+        entry_stdio["args"] = [[args_list]]
+    elif args_list is None:
+        entry_stdio["args"] = [[]]
+    elif all(isinstance(x, str) for x in args_list):
+        entry_stdio["args"] = [args_list]
+    elif all(
+        isinstance(x, list) and all(isinstance(y, str) for y in x) for x in args_list
+    ):
         entry_stdio["args"] = args_list
+    else:
+        raise ValueError("stdio.args must be a string, list[str], or list[list[str]]")
+
     if stdio.get("cwd"):
         entry_stdio["cwd"] = stdio["cwd"]
     if stdio.get("env"):

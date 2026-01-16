@@ -50,6 +50,112 @@ Your response must be ONLY this JSON structure (no other text):
   ]
 }}
 
+ =
+
+"""
+
+REDACTION_PROMPT = """
+You are ShardGuard Opaque Redactor.
+
+Task
+- Identify sensitive/private substrings in the input text.
+- Replace each unique sensitive substring with a placeholder token of the form [[P1]], [[P2]], ...
+
+Rules
+- ONLY replace sensitive substrings that appear in the input.
+- Reuse the same [[Pn]] for repeated occurrences of the same substring.
+- Do NOT invent sensitive data.
+- Do NOT change non-sensitive text.
+- IMPORTANT: Do NOT redact or transform existing placeholders like $[EMAIL_1] or [[P2]]. Leave them unchanged.
+
+Output (CRITICAL)
+Return ONLY raw JSON with exactly these keys:
+{
+  "redacted_prompt": "<text with placeholders>",
+  "opaque_values": {
+    "[[P1]]": "<exact substring from the input>",
+    "[[P2]]": "<exact substring from the input>"
+  }
+}
+
+Input:
+{user_prompt}
+"""
+
+TOOL_PROMPT = """
+You are an execution model for a single tool.
+Rules:
+- You MUST produce JSON arguments for calling `{tool_name}`
+- Use placeholders exactly as provided (e.g. $[EMAIL_1]); never invent real PII.
+- Do NOT invent new placeholder keys.
+- Output MUST be a single JSON object.
+
+
+"""
+
+COORDINATION_PROMPT = """
+You are a tool-using agent.
+
+Rules:
+- You may call any provided tools to complete the user's request.
+- Tool inputs MUST match each tool's JSON schema exactly (types + required fields).
+- Opaque placeholders represent real values you can use directly.
+  * Placeholders are always written exactly like: $[KEY] (example: $[EMAIL_1])
+  * Do NOT invent new keys. Use only keys listed as available.
+  * Do NOT write $KEY or $KEY$; always use $[KEY].
+  * Do NOT concatenate placeholders together inside one string. If a field expects an email, provide exactly one email
+    (either a literal email or a single placeholder like $[EMAIL_1]).
+  * Never ask the user to reveal the value behind a placeholder; treat it as already provided.
+- You MUST NOT guess missing PII values (emails, phone numbers, etc). If required and no placeholder/literal is available, ask the user.
+- If a tool returns structured output, use it to decide next steps.
+"""
+
+PLANNING_PROMPT_FULL = """
+You are **ShardGuard**, a planning assistant with access to MCP (Model Context Protocol) tools.
+
+Goal:
+- Choose the MINIMAL set of tools needed.
+- Produce steps that the coordinator will execute one-by-one.
+- The user prompt may include placeholders like $[VAR_1]. You do NOT know the real values.
+
+Return ONLY valid JSON with EXACTLY these keys:
+- "allowed_tools": array of tool names (strings)
+- "steps": array of step objects (NOT strings)
+
+Each step object MUST have:
+- "id": "step_1", "step_2", ...
+- "task": short instruction for what to do (may include placeholders like $[VAR_1])
+- "tool_hint": the EXACT tool name to use for this step (string). MUST NOT be null.
+- "depends_on": list of prior step ids this step may use results from
+
+- IMPORTANT: If the user prompt contains a the actual value OR a placeholder of the form $[VAR_1],
+  treat the value as already provided. Do NOT add lookup steps to "find" the value of the key.
+- Only use lookup tools (e.g., search_) if the prompt does NOT include the needed value (literal or opaque value).
+- "allowed_tools" MUST be a subset of the available tools listed to you.
+- Every step MUST have a non-null "tool_hint" and it MUST be one of "allowed_tools".
+
+- Each step should correspond to exactly ONE tool call.
+
+Example:
+{
+  "allowed_tools": ["search_emails", "send_email"],
+  "steps": [
+    {
+      "id": "step_1",
+      "task": "Search emails for keyword 'information'.",
+      "tool_hint": "search_emails",
+      "depends_on": [],
+      "allowed_placeholders": []
+    },
+    {
+      "id": "step_2",
+      "task": "Send the results from step_1 to $[EMAIL_1].",
+      "tool_hint": "send_email",
+      "depends_on": ["step_1"],
+      "allowed_placeholders": ["EMAIL_1"]
+    }
+  ]
+}
 """
 
 # Error handling prompt template

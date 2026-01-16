@@ -1,11 +1,27 @@
-"""LLM provider implementations for ShardGuard."""
+from __future__ import annotations
 
 import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from typing import Any, Protocol
+
+import google.generativeai as genai  # type: ignore
+import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class ToolArgsLLM(Protocol):
+    async def generate_tool_args(
+        self,
+        *,
+        tool_name: str,
+        tool_schema: dict[str, Any],
+        step_text: str,
+        visible_placeholders: set[str],
+        previous_results: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class LLMProvider(ABC):
@@ -41,8 +57,6 @@ class OllamaProvider(LLMProvider):
     def _init_client(self):
         """Initialize the HTTP client."""
         try:
-            import httpx
-
             self.client = httpx.Client(timeout=300.0)
         except ImportError:
             logger.warning(
@@ -146,8 +160,6 @@ class GeminiProvider(LLMProvider):
             return
 
         try:
-            import google.generativeai as genai
-
             genai.configure(api_key=self.api_key)
             self.client = genai.GenerativeModel(self.model)
             logger.info(f"Initialized Gemini client with model: {self.model}")

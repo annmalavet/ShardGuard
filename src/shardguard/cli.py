@@ -1,15 +1,40 @@
 """ShardGuard CLI - Command-line interface for safe task execution."""
 
+from __future__ import annotations
+
 import asyncio
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from shardguard.core.coordination import CoordinationService
 from shardguard.core.planning import PlanningLLM
 from shardguard.mcp_servers import registry as reg_lib
+from shardguard.utils.print_util import (
+    _count_tools_and_servers,
+    _print_tools_info,
+    _print_verbose_tools_info,
+    log_err,
+    log_success,
+    print_json,
+)
+
+EXECUTOR_PROVIDER_OPTION = typer.Option(
+    None,
+    "--executor-provider",
+    help="Executor LLM for tool-arg generation on the FIRST planned step only (ollama/gemini/openai). Default: openai",
+)
+EXECUTOR_MODEL_OPTION = typer.Option(
+    None,
+    "--executor-model",
+    help="Model for executor provider (defaults per provider).",
+)
 
 # Load environment variables from .env file
 try:
@@ -19,28 +44,15 @@ try:
 except ImportError:
     pass
 
-app = typer.Typer(help="ShardGuard CLI")
+app = typer.Typer(
+    help="ShardGuard CLI",
+    pretty_exceptions_show_locals=False,
+    pretty_exceptions_short=True,
+)
 console = Console()
-
-
-def log_success(msg: str):
-    console.print(f"[green]{msg}[/green]")
-
-
-def log_err(msg: str):
-    console.print(f"[red]{msg}[/red]")
-
 
 registry_app = typer.Typer(no_args_is_help=True)
 app.add_typer(registry_app, name="registry")
-
-
-def _count_tools_and_servers(tools_description: str) -> tuple[int, int]:
-    """Count tools and servers from tools description."""
-    lines = tools_description.split("\n")
-    tool_count = len([line for line in lines if line.strip().startswith("•")])
-    server_count = len([line for line in lines if line.strip().startswith("Server:")])
-    return tool_count, server_count
 
 
 @asynccontextmanager
@@ -54,7 +66,10 @@ async def create_planner(
     console.print(f"[dim]🔌 Initializing {provider_type} provider...[/dim]")
 
     planner = PlanningLLM(
-        provider_type=provider_type, model=model, base_url=base_url, api_key=api_key
+        provider_type=provider_type,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
     )
 
     try:
@@ -102,36 +117,6 @@ def _print_provider_info(provider: str, model: str, ollama_url: str) -> None:
         console.print(f"[dim]Using Gemini model: {model}[/dim]")
 
 
-def _print_tools_info(tools_description: str, verbose: bool = False) -> None:
-    """Print information about available tools."""
-    if "No MCP tools available." in tools_description:
-        return
-
-    if verbose:
-        console.print("[bold blue]MCP Servers & Tools:[/bold blue]")
-        _print_verbose_tools_info(tools_description)
-    else:
-        tool_count, server_count = _count_tools_and_servers(tools_description)
-        console.print(
-            f"[dim]Available tools: {tool_count} tools from {server_count} servers[/dim]"
-        )
-
-
-def _print_verbose_tools_info(tools_description: str) -> None:
-    """Print detailed server and tool information."""
-    for line in tools_description.split("\n"):
-        stripped_line = line.strip()
-        if stripped_line.startswith("Server:"):
-            server_name = stripped_line.replace("Server:", "").strip()
-            console.print(f"[bold cyan]{server_name}[/bold cyan]")
-        elif stripped_line.startswith("•"):
-            tool_name = stripped_line.replace("•", "").strip()
-            if ":" in tool_name:
-                tool_name = tool_name.split(":")[0]
-            console.print(f"  └── [green]{tool_name}[/green]")
-    console.print()
-
-
 def _handle_errors(e: Exception, provider: str) -> None:
     """Handle and display errors appropriately."""
     if isinstance(e, ConnectionError):
@@ -160,6 +145,17 @@ GEMINI_API_KEY_OPTION = typer.Option(
 )
 VERBOSE_OPTION = typer.Option(
     False, "--verbose", "-v", help="Show detailed information"
+)
+
+REGISTRY_PATH_OPTION = typer.Option(
+    "src/shardguard/mcp_servers/mcp_registry.json",
+    "--registry-path",
+    help="Path to the MCP registry JSON file",
+)
+OPENAI_MODEL_OPTION = typer.Option(
+    "gpt-4o-mini",
+    "--openai-model",
+    help="OpenAI model name",
 )
 
 
@@ -191,39 +187,117 @@ def list_tools(
     asyncio.run(_list_tools())
 
 
-@app.command()
+@app.command("plan")
 def plan(
-    prompt: str,
+    prompt: str = typer.Argument(..., help="User request"),
+    execute: bool = typer.Option(
+        False,
+        "-x",
+        help="Execute tool calling",
+    ),
     provider: str = PROVIDER_OPTION,
     model: str = MODEL_OPTION,
-    ollama_url: str = OLLAMA_URL_OPTION,
-    gemini_api_key: str = GEMINI_API_KEY_OPTION,
-    verbose: bool = VERBOSE_OPTION,
+    json_out: bool = typer.Option(False, "--json"),
+    registry_path: str = REGISTRY_PATH_OPTION,
+    openai_model: str = OPENAI_MODEL_OPTION,
+    executor_provider: str | None = EXECUTOR_PROVIDER_OPTION,
+    executor_model: str | None = EXECUTOR_MODEL_OPTION,
+    api_key: str | None = GEMINI_API_KEY_OPTION,
 ):
-    """Generate a safe execution plan for a user prompt."""
+    async def _run():
+        _validate_gemini_api_key(provider, api_key)
+        detected_model = _get_model_for_provider(provider, model)
+        if not os.getenv("OPENAI_API_KEY"):
+            console.print("[bold red]Error:[/bold red] OPENAI_API_KEY is not set. ")
+            raise typer.Exit(1)
+        console.print(f"[dim]OpenAI chain model: {openai_model}[/dim]")
+        console.print(
+            f"[dim]First-step executor: {executor_provider or '(OpenAI - default)'} {executor_model or ''}[/dim]"
+        )
 
-    async def _plan():
+        coord = CoordinationService(
+            registry_path=registry_path,
+            openai_model=openai_model,  # for Coordinator to chain subprompts
+            step_executor=detected_model,  # "ollama" | "gemini" | "openai"
+            ollama_model=(executor_model or "llama3.2"),
+            gemini_model=(executor_model or "gemini-2.0-flash-exp"),
+            gemini_api_key=api_key,
+        )
+
         try:
-            api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
-            _validate_gemini_api_key(provider, api_key)
-            detected_model = _get_model_for_provider(provider, model)
-
-            async with create_planner(
-                provider, detected_model, ollama_url, api_key
-            ) as planner:
-                _print_provider_info(provider, detected_model, ollama_url)
-
-                tools_description = await planner.get_available_tools_description()
-                _print_tools_info(tools_description, verbose)
-
-                coord = CoordinationService(planner)
-                plan_obj = await coord.handle_prompt(prompt)
-                typer.echo(plan_obj.model_dump_json(indent=2))
-
+            result = await coord.runJob(prompt, execute)
         except Exception as e:
-            _handle_errors(e, provider)
+            logging.getLogger(__name__).exception("coord.run failed")
+            console.print(f"[bold red]Coordinator error:[/bold red] {e}")
+            console.print("[dim]See shardguard_debug.log for details.[/dim]")
+            raise typer.Exit(1)
 
-    asyncio.run(_plan())
+        print_json(result)
+        if json_out:
+            print_json(result)
+            return
+
+        console.print(
+            Panel(
+                f"[bold]User Prompt:[/bold] {prompt}",
+                title="",
+                border_style="green",
+            )
+        )
+
+        # Print trace of tool calls
+        trace = result.get("trace") or []
+        if trace:
+            table = Table(title="", expand=True)
+            table.add_column("Step", justify="right", style="cyan", no_wrap=True)
+            table.add_column("Tool", style="magenta")
+            table.add_column("Opaque values", style="yellow")
+            table.add_column("Output (redacted)", style="white")
+
+            for i, item in enumerate(trace, start=1):
+                tool = str(item.get("tool", ""))
+                args = item.get("arguments", {})
+                out = (
+                    item.get("result")
+                    or item.get("result_handle")
+                    or item.get("output")
+                    or {}
+                )
+
+                table.add_row(
+                    str(i),
+                    tool,
+                    json.dumps(args, ensure_ascii=False),
+                    json.dumps(out, ensure_ascii=False),
+                )
+            console.print(table)
+
+        final_text = result.get("final_text") or ""
+        usage = result.get("usage") or {}
+        if usage:
+            console.print(
+                Panel(
+                    f"prompt_tokens={usage.get('prompt_tokens', 0)}\n"
+                    f"completion_tokens={usage.get('completion_tokens', 0)}\n"
+                    f"total_tokens={usage.get('total_tokens', 0)}",
+                    title="Tokens used",
+                    border_style="magenta",
+                )
+            )
+
+        if final_text:
+            console.print(Panel(final_text, title="Response", border_style="blue"))
+        else:
+            console.print("[dim](No execution response text returned)[/dim]")
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        logging.getLogger(__name__).exception("ShardGuard CLI crashed")
+        console.print(f"[bold red]Error:[/bold red] {e}")
+    raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
@@ -236,11 +310,10 @@ def main(
 
         async def _init():
             console.print("🛡️  [bold blue]Welcome to ShardGuard![/bold blue]")
-            async with create_planner() as planner:
-                if verbose:
+            if verbose:
+                async with create_planner() as planner:
                     tools_description = await planner.get_available_tools_description()
-                    _print_verbose_tools_info(tools_description)
-
+                    _print_tools_info(tools_description, verbose=True)
             console.print("\n[dim]Use --help to see available commands.[/dim]")
             console.print("[dim]Available commands: list-tools, plan[/dim]")
             console.print("[dim]Supported providers: ollama (default), gemini[/dim]")
@@ -280,6 +353,7 @@ def registry_add_mcp(
             http=http_config,
             stdio=stdio_config,
         )
+
         log_success(f"Added MCP {name}")
     except ValueError as e:
         log_err(str(e))

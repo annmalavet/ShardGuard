@@ -56,6 +56,27 @@ def _http_rpc(
     return data.get("result", {})
 
 
+def _http_notify(
+    url: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    session_id: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    }
+    requests.post(
+        url,
+        headers=_headers(session_id, headers),
+        data=json.dumps(payload),
+        timeout=5.0,
+    )
+
+
 class _StdioRPC:
     """
     JSON-RPC over stdio with two framing modes:
@@ -258,6 +279,19 @@ class MCPClient:
         else:
             raise ValueError(f"Unsupported transport: {transport}")
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a notification to the server."""
+        if self.transport == "streamable-http":
+            _http_notify(
+                self.http_url,
+                method,
+                params or {},
+                session_id=self.session_id,
+                headers=self.http_headers,
+            )
+        elif self.stdio:
+            self.stdio.notify(method, params or {})
+
     def initialize(
         self, *, timeout: float = 15.0, protocol_version: str | None = None
     ) -> dict[str, Any]:
@@ -273,7 +307,7 @@ class MCPClient:
             }
             try:
                 if self.transport == "streamable-http":
-                    return _http_rpc(
+                    res = _http_rpc(
                         self.http_url,
                         "initialize",
                         params,
@@ -281,7 +315,12 @@ class MCPClient:
                         headers=self.http_headers,
                         timeout=timeout,
                     )
-                return self.stdio.request("initialize", params, timeout=timeout)
+                else:
+                    res = self.stdio.request("initialize", params, timeout=timeout)
+
+                # Initialize before sending request
+                self.notify("notifications/initialized")
+                return res
             except Exception as e:
                 last = e
         raise last or RuntimeError("initialize failed for all protocol versions")
