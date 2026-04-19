@@ -1,10 +1,241 @@
 """Input sanitization utilities for ShardGuard."""
 
 import re
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PLACEHOLDER_RE = re.compile(r"\$\[([A-Za-z0-9_]+)\]")  # preferred: $[KEY]
+_DOLLAR_KEY_RE = re.compile(
+    r"\$([A-Za-z][A-Za-z0-9_]*)\$?"
+)  # tolerated: $KEY or $KEY$ (could happen in LLM provider mistakes)
+
+
+def _is_valid_email(s: str) -> bool:
+    return bool(_EMAIL_RE.match(s.strip()))
+
+
+def _is_valid_datetime(s: str) -> bool:
+    try:
+        t = s.strip()
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+
+        datetime.fromisoformat(t)
+        return True
+    except Exception:
+        return False
+
+
+_PLACEHOLDER_TOKEN_RE = re.compile(r"^\$\[[A-Za-z0-9_]+\]$")
+
+
+def _canonical_placeholder_token(key: str) -> str:
+    return f"$[{key}]"
+
+
+def _extract_placeholder_keys(s: str) -> list[str]:
+    keys: list[str] = []
+    for m in _PLACEHOLDER_RE.finditer(s):
+        keys.append(m.group(1))
+    for m in _DOLLAR_KEY_RE.finditer(s):
+        keys.append(m.group(1))
+    return keys
+
+
+def _is_scalar_placeholder_allowed(prop_schema: dict[str, Any]) -> bool:
+    # For scalar type fields where a placeholder should stand in for the whole value
+    t = prop_schema.get("type")
+    fmt = prop_schema.get("format")
+    if fmt in ("email", "date-time"):
+        return True
+    if t in ("integer", "number", "boolean"):
+        return True
+    return False
+
+
+def _canonicalize_scalar_placeholders(
+    args: dict[str, Any], schema: dict[str, Any], available_keys: set[str]
+) -> dict[str, Any]:
+    """
+    If the model embeds a placeholder inside extra chars for a scalar field (email/datetime/number/etc),
+    try to fix by collapsing to a single canonical token $[KEY] when exactly one KEY is present
+
+    Example: "$EMAIL_1}nfo@email.com" -> "$[EMAIL_1]" (then coordinator resolves to the real email).
+    """
+    if not isinstance(args, dict) or not isinstance(schema, dict):
+        return args
+
+    out: dict[str, Any] = dict(args)
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return out
+
+    for k, v in list(out.items()):
+        prop_schema = props.get(k) if isinstance(props.get(k), dict) else None
+        if not prop_schema or not isinstance(v, str):
+            continue
+        if not _is_scalar_placeholder_allowed(prop_schema):
+            continue
+
+        keys = [kk for kk in _extract_placeholder_keys(v) if kk in available_keys]
+        uniq = []
+        for kk in keys:
+            if kk not in uniq:
+                uniq.append(kk)
+        if len(uniq) == 1 and v.strip() != _canonical_placeholder_token(uniq[0]):
+            # If there is other text around, collapse to placeholder only.
+            out[k] = _canonical_placeholder_token(uniq[0])
+
+    return out
+
+
+def _iter_option_schemas(prop_schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return schemas to check, unwrapping anyOf/oneOf if present."""
+    for key in ("anyOf", "oneOf"):
+        options = prop_schema.get(key)
+        if isinstance(options, list):
+            return [s for s in options if isinstance(s, dict)]
+    return [prop_schema]
+
+
+def _add_format_error(
+    errs: list[dict[str, Any]],
+    *,
+    key: str,
+    validation: str,
+    message: str,
+) -> None:
+    errs.append(
+        {
+            "path": [key],
+            "code": "invalid_string",
+            "validation": validation,
+            "message": message,
+        }
+    )
+
+
+def _as_str_list(v: Any) -> list[str]:
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return v
+    return []
+
+
+def _as_steps_list(planning: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = planning.get("steps") or []
+    if not isinstance(steps, list):
+        return []
+    return [s for s in steps if isinstance(s, dict)]
+
+
+def _is_allowed_tool(tool_name: str, allowed_set: set[str]) -> bool:
+    return (not allowed_set) or (tool_name in allowed_set)
+
+
+def _build_tool_def(tool_info: Any) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": tool_info.name,
+        "description": tool_info.description,
+        "parameters": tool_info.parameters,
+        "strict": True,
+    }
+
+
+def _validate_formats(
+    args: dict[str, Any], schema: dict[str, Any]
+) -> list[dict[str, Any]]:
+    errs: list[dict[str, Any]] = []
+
+    if not isinstance(args, dict) or not isinstance(schema, dict):
+        return errs
+
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return errs
+
+    validators: dict[str, tuple[Callable[[str], bool], str, str]] = {
+        "email": (_is_valid_email, "email", "Invalid email"),
+        "date-time": (_is_valid_datetime, "datetime", "Invalid datetime"),
+    }
+
+    for key, prop_schema_any in props.items():
+        if key not in args or not isinstance(prop_schema_any, dict):
+            continue
+
+        value = args.get(key)
+        if not isinstance(value, str):
+            continue
+
+        for opt_schema in _iter_option_schemas(prop_schema_any):
+            fmt = opt_schema.get("format")
+            entry = validators.get(fmt) if isinstance(fmt, str) else None
+            if entry is None:
+                continue
+
+            is_valid, validation, message = entry
+            if not is_valid(value):
+                _add_format_error(errs, key=key, validation=validation, message=message)
+            break  # stop after first recognized format among options
+
+    return errs
+
+
+_TYPE_CASTERS: dict[str, Any] = {
+    "string": str,
+    "number": float,
+    "integer": int,
+    "boolean": lambda v: v if isinstance(v, bool) else str(v).lower() == "true",
+    "array": lambda v: v
+    if isinstance(v, list)
+    else ([v] if v not in (None, "") else []),
+    "object": lambda v: v if isinstance(v, dict) else {},
+}
+
+_PYTHON_TYPES: dict[str, type | tuple[type, ...]] = {
+    "string": str,
+    "number": (int, float),
+    "integer": int,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _schema_type(spec: dict[str, Any]) -> str | None:
+    """Return the primary non-null type from a schema spec, handling anyOf."""
+    if "type" in spec:
+        return spec["type"]
+    for sub in spec.get("anyOf", []):
+        if isinstance(sub, dict) and sub.get("type") not in (None, "null"):
+            return sub["type"]
+    return None
+
+
+def _coerce_types(args: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Coerce each arg value to the type declared in the tool's JSON schema."""
+    props = (schema or {}).get("properties") or {}
+    out = dict(args)
+    for k, spec in props.items():
+        if k not in out:
+            continue
+        expected = _schema_type(spec)
+        if not expected:
+            continue
+        python_type = _PYTHON_TYPES.get(expected)
+        caster = _TYPE_CASTERS.get(expected)
+        if caster and python_type and not isinstance(out[k], python_type):
+            try:
+                out[k] = caster(out[k])
+            except Exception:
+                pass
+    return out
 
 
 class SanitizationResult:

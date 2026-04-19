@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import time
 from collections.abc import Iterable
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from shardguard.core.mcp_client import MCPClient
+
+logger = logging.getLogger(__name__)
 
 REG_MCP_KEY = "mcps"
 
@@ -73,6 +76,7 @@ def add_mcp(
         entry["stdio"] = _build_stdio_entry(stdio)
 
     mcps[name] = entry
+
     _atomic_write(registry_path, reg)
     return reg
 
@@ -133,8 +137,8 @@ def parse_transport_config(
     stdio_config = {"cmd": cmd, "framing": framing}
 
     parsed_args = _parse_json_arg(args)
-    if parsed_args:
-        stdio_config["args"] = parsed_args
+    if args is not None:
+        stdio_config["args"] = parsed_args if parsed_args is not None else args
 
     if cwd:
         stdio_config["cwd"] = cwd
@@ -167,28 +171,26 @@ def _build_http_entry(http: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _coerce_args_list(raw_args: Any) -> list[str] | None:
+def _coerce_args_list(raw_args: Any) -> list[str]:
     if raw_args is None:
-        return None
-    if isinstance(raw_args, list):
+        return []
+    if isinstance(raw_args, list) and all(isinstance(x, str) for x in raw_args):
         return raw_args
     if isinstance(raw_args, str):
         return [raw_args]
-    raise ValueError("stdio.args has a parsing error.")
+    raise ValueError("stdio.args must be a string or list[str]")
 
 
 def _build_stdio_entry(stdio: dict[str, Any] | None) -> dict[str, Any]:
     if not stdio or not isinstance(stdio, dict) or not stdio.get("cmd"):
         raise ValueError("stdio.cmd is required for stdio")
 
-    args_list = _coerce_args_list(stdio.get("args"))
-
     entry_stdio: dict[str, Any] = {
         "cmd": stdio["cmd"],
         "framing": (stdio.get("framing") or "jsonl").lower(),
+        "args": _coerce_args_list(stdio.get("args")),
     }
-    if args_list:
-        entry_stdio["args"] = args_list
+
     if stdio.get("cwd"):
         entry_stdio["cwd"] = stdio["cwd"]
     if stdio.get("env"):
@@ -279,7 +281,8 @@ def fetch_all_tools(
     for name in mcps.keys():
         try:
             out[name] = fetch_tools(registry_path, name, init=init, timeout=timeout)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to fetch tools from %r: %s", name, exc)
             out[name] = []
     return out
 
@@ -289,6 +292,6 @@ def clear_client_cache() -> None:
     for c in _CLIENTS.values():
         try:
             c.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to close MCP client: %s", exc)
     _CLIENTS.clear()

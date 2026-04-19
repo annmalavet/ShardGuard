@@ -1,174 +1,124 @@
-"""Planning LLM with MCP integration and multiple provider support."""
-
-import asyncio
 import json
 import logging
-import re
-from pathlib import Path
-from typing import Any, Protocol
+from datetime import UTC, datetime
+from typing import Any
 
-from shardguard.core.mcp_client import PROJECT_ROOT
-from shardguard.mcp_servers import registry
+from openai import AsyncOpenAI  # type: ignore
 
-from .llm_providers import LLMProviderFactory
+from shardguard.core.prompts import PLANNING_PROMPT_FULL
+from shardguard.core.tool_args_llm import _write_context_log
 
 logger = logging.getLogger(__name__)
 
 
-class PlanningLLMProtocol(Protocol):
-    """Protocol for planning LLM implementations."""
-
-    async def generate_plan(self, prompt: str) -> str: ...
-
-
 class PlanningLLM:
-    """Planning LLM with MCP integration and multiple provider support."""
+    """
+    Least-privilege planner:
+    - No access to tools
+    - No access to the opaque-store keys list (only sees the redacted prompt)
+    - Outputs a tool list
+    """
 
-    def __init__(
-        self,
-        provider_type: str = "ollama",
-        model: str = "llama3.2",
-        base_url: str = "http://localhost:11434",
-        api_key: str | None = None,
-    ):
-        root = Path(PROJECT_ROOT).resolve()
-        if root.name == "core":
-            root = root.parent.parent
-        elif root.name == "shardguard":
-            root = root.parent
-        elif root.name == "src":
-            root = root.parent
-
-        self.registry_path = str(
-            root / "src" / "shardguard" / "mcp_servers" / "mcp_registry.json"
-        )
-
-        """Initialize with MCP client integration and configurable LLM provider."""
-        self.provider_type = provider_type
+    def __init__(self, client: AsyncOpenAI, model: str = "gpt-4o-mini") -> None:
+        self._client = client
         self.model = model
-        self.base_url = base_url
-        self.api_key = api_key
 
-        # Create the appropriate LLM provider
-        provider_kwargs = {}
-        if provider_type.lower() == "ollama":
-            provider_kwargs["base_url"] = base_url
-        elif provider_type.lower() == "gemini":
-            provider_kwargs["api_key"] = api_key
+    @staticmethod
+    def _extract_json_object(s: str) -> str | None:
+        s = s.strip()
+        if not s:
+            return None
+        if s.startswith("{") and s.endswith("}"):
+            return s
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return s[start : end + 1]
+        return None
 
-        self.llm_provider = LLMProviderFactory.create_provider(
-            provider_type=provider_type, model=model, **provider_kwargs
-        )
+    async def plan(
+        self, redacted_prompt: str, tool_summaries: list[tuple[str, str]]
+    ) -> dict[str, Any]:
+        tools_txt = "\n".join(f"- {name}: {desc}" for name, desc in tool_summaries)
 
-    async def generate_plan(self, prompt: str) -> str:
-        """Generate a plan using the configured LLM provider."""
-        tools_description = await self.get_available_tools_description()
+        instructions = PLANNING_PROMPT_FULL
+        user_msg = f"User request:\n{redacted_prompt}\n\nAvailable tools:\n{tools_txt}"
 
-        # Create enhanced prompt with tools
-        enhanced_prompt = (
-            f"### Available MCP Servers & Tools ###\n{tools_description}\n\n"
-            f"### User Request ###\n{prompt}"
-        )
-
-        logger.debug("Full prompt sent to model:\n%s", enhanced_prompt)
-
-        try:
-            raw_response = await self.llm_provider.generate_response(enhanced_prompt)
-            return self._extract_json_from_response(raw_response)
-        except Exception as e:
-            logger.error(f"Error generating plan: {e}")
-            return self._create_fallback_response(prompt, str(e))
-
-    async def get_available_tools_description(self) -> str:
-        """Get formatted description of all available MCP tools."""
-        registry._CLIENTS.clear()
-        tools_map = await asyncio.to_thread(
-            registry.fetch_all_tools, self.registry_path
-        )
-
-        try:
-            reg_data = await asyncio.to_thread(
-                registry.load_registry, self.registry_path
-            )
-            mcps: dict[str, dict[str, Any]] = reg_data.get("mcps", {})
-
-            if not mcps:
-                logger.warning(f"No mcps found in registry at {self.registry_path}")
-                return "No MCP Servers registered."
-
-            tools_map: dict[str, list[dict[str, Any]]] = await asyncio.to_thread(
-                registry.fetch_all_tools, self.registry_path
-            )
-
-            lines: list[str] = []
-            for server_name in mcps.keys():
-                lines.append(f"MCP_SERVER: {server_name}")
-
-                server_tools = tools_map.get(server_name) or []
-                if not server_tools:
-                    lines.append("  (Status: Offline or No Tools Found)\n")
-                    continue
-
-                for tool in server_tools:
-                    t_name = tool.get("name") or ""
-                    t_desc = tool.get("description") or "No description provided."
-                    lines.append(f"  - TOOL_KEY: {t_name}")
-                    lines.append(f"    TOOL_DESCRIPTION: {t_desc}")
-
-                    schema = tool.get("inputSchema")
-                    if schema:
-                        lines.append(
-                            f"    TOOL_SCHEMA: {json.dumps(schema, sort_keys=True)}"
-                        )
-
-                lines.append("")  # spacer
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.error(f"Failed to fetch tools: {e}")
-            return f"Error loading tools from registry: {e}"
-
-    def _extract_json_from_response(self, response: str) -> str:
-        """Extract JSON from LLM response that might contain extra text."""
-        # Try to find JSON block enclosed in curly braces
-        matches = re.findall(r"\{.*\}", response, re.DOTALL)
-
-        if matches:
-            # Return the longest JSON-like match
-            json_candidate = max(matches, key=len)
-            # Validate that it's actually valid JSON
-            try:
-                json.loads(json_candidate)
-                return json_candidate
-            except json.JSONDecodeError:
-                pass
-
-        # If no valid JSON found, return the original response
-        return response
-
-    def _create_fallback_response(self, prompt: str, error: str) -> str:
-        """Create a fallback response when plan generation fails."""
-        return json.dumps(
+        _write_context_log(
             {
-                "original_prompt": prompt,
-                "sub_prompts": [
-                    {
-                        "id": 1,
-                        "content": f"Error occurred: {error}",
-                        "opaque_values": {},
-                        "suggested_tools": [],
-                    }
-                ],
+                "timestamp": datetime.now(UTC).isoformat(),
+                "llm_instance": "planner",
+                "model": self.model,
+                "context": {
+                    "system": instructions,
+                    "user": user_msg,
+                },
+                "estimated_chars": len(instructions) + len(user_msg),
             }
         )
 
-    def close(self):
-        """Close any open connections."""
-        self.llm_provider.close()
+        resp = await self._client.responses.create(
+            model=self.model,
+            instructions=instructions,
+            input=[{"role": "user", "content": user_msg}],
+        )
 
-    async def __aenter__(self):
-        return self
+        txt = (getattr(resp, "output_text", "") or "").strip()
+        blob = self._extract_json_object(txt) or "{}"
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        try:
+            obj = json.loads(blob)
+        except Exception as exc:
+            logger.warning("Planner JSON parse failure: %s | raw=%r", exc, txt[:200])
+            obj = {}
+
+        allowed = obj.get("allowed_tools")
+        steps = obj.get("steps")
+
+        if not isinstance(allowed, list) or not all(
+            isinstance(x, str) for x in allowed
+        ):
+            allowed = []
+
+        steps2: list[dict[str, Any]] = []
+        if isinstance(steps, list):
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                sid = s.get("id")
+                task = s.get("task")
+                tool_hint = s.get("tool_hint")
+                depends_on = s.get("depends_on", [])
+                placeholder_args = s.get("placeholder_args") or {}
+
+                if not isinstance(sid, str) or not isinstance(task, str):
+                    continue
+                if tool_hint is not None and not isinstance(tool_hint, str):
+                    tool_hint = None
+                if not isinstance(depends_on, list) or not all(
+                    isinstance(x, str) for x in depends_on
+                ):
+                    depends_on = []
+                if not isinstance(placeholder_args, dict):
+                    placeholder_args = {}
+
+                steps2.append(
+                    {
+                        "id": sid,
+                        "task": task,
+                        "tool_hint": tool_hint,
+                        "depends_on": depends_on,
+                        "placeholder_args": placeholder_args,
+                    }
+                )
+        else:
+            steps2 = []
+
+        seen: set[str] = set()
+        allowed2: list[str] = []
+        for name in allowed:
+            if name not in seen:
+                seen.add(name)
+                allowed2.append(name)
+
+        return {"allowed_tools": allowed2, "steps": steps2}

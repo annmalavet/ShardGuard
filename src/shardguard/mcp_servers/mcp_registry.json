@@ -5,10 +5,9 @@
       "description": "File operations with security controls",
       "stdio": {
         "cmd": "python",
+        "framing": "jsonl",
         "args": [
-          [
-            "src/shardguard/mcp_servers/file_server.py"
-          ]
+          "src/shardguard/mcp_servers/file_server.py"
         ]
       },
       "tools": {
@@ -22,10 +21,9 @@
       "description": "Database operations with security controls",
       "stdio": {
         "cmd": "python",
+        "framing": "jsonl",
         "args": [
-          [
             "src/shardguard/mcp_servers/database_server.py"
-          ]
         ]
       },
       "tools": {
@@ -39,6 +37,7 @@
       "description": "Web operations with security controls",
       "stdio": {
         "cmd": "python",
+        "framing": "jsonl",
         "args": [
           "-m",
           "shardguard.mcp_servers.web_server"
@@ -47,6 +46,24 @@
       "tools": {
         "allow": [
           "*"
+        ]
+      }
+    },
+    "email-operations": {
+      "transport": "stdio",
+      "description": "Email service",
+      "tools": {
+        "allow": [
+          "*"
+        ],
+        "deny": [],
+        "rename": {}
+      },
+      "stdio": {
+        "cmd": "python",
+        "framing": "jsonl",
+        "args": [
+          "src/shardguard/mcp_servers/email_server.py"
         ]
       }
     }

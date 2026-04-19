@@ -13,7 +13,7 @@ from typing import Any
 import requests
 from rich.console import Console
 
-PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
 console = Console()
 
 
@@ -54,6 +54,27 @@ def _http_rpc(
     if "error" in data:
         raise RuntimeError(f"{url} {method} error: {data['error']}")
     return data.get("result", {})
+
+
+def _http_notify(
+    url: str,
+    method: str,
+    params: dict[str, Any],
+    *,
+    session_id: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    payload = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    }
+    requests.post(
+        url,
+        headers=_headers(session_id, headers),
+        data=json.dumps(payload),
+        timeout=5.0,
+    )
 
 
 class _StdioRPC:
@@ -177,6 +198,19 @@ class _StdioRPC:
             return self._read_jsonl_frame(max(0.0, deadline - time.time()))
         return json.loads(line.decode("utf-8"))
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        if self.proc.poll() is not None:
+            return
+        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        data = json.dumps(payload).encode("utf-8")
+        if self.framing == "lsp":
+            hdr = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
+            self.proc.stdin.write(hdr)
+            self.proc.stdin.write(data)
+        else:
+            self.proc.stdin.write(data + b"\n")
+        self.proc.stdin.flush()
+
     def request(
         self, method: str, params: dict[str, Any], *, timeout: float = 30.0
     ) -> dict[str, Any]:
@@ -242,6 +276,7 @@ class MCPClient:
         self.http_url = http_url.rstrip("/") if http_url else None
         self.http_headers = http_headers or {}
         self.stdio = None
+        self._initialized = False
         if transport == "streamable-http":
             if not self.http_url:
                 raise ValueError("streamable-http requires http_url")
@@ -258,9 +293,25 @@ class MCPClient:
         else:
             raise ValueError(f"Unsupported transport: {transport}")
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a notification to the server."""
+        if self.transport == "streamable-http":
+            _http_notify(
+                self.http_url,
+                method,
+                params or {},
+                session_id=self.session_id,
+                headers=self.http_headers,
+            )
+        elif self.stdio:
+            self.stdio.notify(method, params or {})
+
     def initialize(
         self, *, timeout: float = 15.0, protocol_version: str | None = None
     ) -> dict[str, Any]:
+        if self._initialized and self.transport == "stdio":
+            return {}
+
         versions = (
             [protocol_version] if protocol_version else ["2025-06-18", "2025-05-01"]
         )
@@ -273,7 +324,7 @@ class MCPClient:
             }
             try:
                 if self.transport == "streamable-http":
-                    return _http_rpc(
+                    res = _http_rpc(
                         self.http_url,
                         "initialize",
                         params,
@@ -281,7 +332,12 @@ class MCPClient:
                         headers=self.http_headers,
                         timeout=timeout,
                     )
-                return self.stdio.request("initialize", params, timeout=timeout)
+                else:
+                    res = self.stdio.request("initialize", params, timeout=timeout)
+
+                self.notify("notifications/initialized")
+                self._initialized = True
+                return res
             except Exception as e:
                 last = e
         raise last or RuntimeError("initialize failed for all protocol versions")
@@ -299,6 +355,23 @@ class MCPClient:
         else:
             res = self.stdio.request("tools/list", {}, timeout=timeout)
         return res.get("tools", [])
+
+    def resources_list(self, *, timeout: float = 15.0) -> list[dict[str, Any]]:
+        try:
+            if self.transport == "streamable-http":
+                res = _http_rpc(
+                    self.http_url,
+                    "resources/list",
+                    {},
+                    session_id=self.session_id,
+                    headers=self.http_headers,
+                    timeout=timeout,
+                )
+            else:
+                res = self.stdio.request("resources/list", {}, timeout=timeout)
+            return res.get("resources", [])
+        except Exception:
+            return []
 
     def tools_call(
         self,
